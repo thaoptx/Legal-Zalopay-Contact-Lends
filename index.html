@@ -1177,19 +1177,37 @@ async function runReview(){
     if(refMode==='upload'&&refFileBytes)fd.append('ref_file',new Blob([refFileBytes]),refFileName||'ref.docx');
     if(refMode==='template')fd.append('use_template','true');
     if(refMode==='reflink'&&refLinkVal)fd.append('ref_link',refLinkVal);
-    const res=await fetch('/api/review',{method:'POST',body:fd});
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const res=await fetch('/api/review',{method:'POST',body:fd,signal:controller.signal});
+    clearTimeout(timeoutId);
     const data=await res.json();
     if(data.error){toast('Lỗi: '+data.error,5000);document.getElementById('pmBody').innerHTML=`<div class="empty-mid"><div class="em-ico">⚠️</div><p>${esc(data.error)}</p></div>`;document.getElementById('runBtn').disabled=false;return;}
-    curResult=data.result;curRid=data.review_id;
-    await init();
-    renderResult(data.result);renderHistList();updateRight();
-  }catch(e){toast('Lỗi kết nối: '+e.message,5000);document.getElementById('runBtn').disabled=false;}
+
+    const resultText = data.result || data.review || data.content || data.message || data.output || data.text || '';
+    if(!resultText){
+      console.log('Unexpected /api/review response:', data);
+      toast('API đã phản hồi nhưng frontend không đọc được định dạng kết quả.',5000);
+      document.getElementById('pmBody').innerHTML=`<div class="empty-mid"><div class="em-ico">⚠️</div><p>API đã phản hồi nhưng không có kết quả đúng định dạng để hiển thị.</p></div>`;
+      document.getElementById('runBtn').disabled=false;
+      return;
+    }
+
+    curResult=String(resultText);curRid=data.review_id||data.id||Date.now().toString();
+    try{await init();}catch(e){console.log(e);}
+    renderResult(curResult);
+    try{renderHistList();updateRight();}catch(e){console.log(e);}
+  }catch(e){
+    const msg=e.name==='AbortError'?'AI xử lý quá lâu. Vui lòng thử file ngắn hơn hoặc chạy lại.':'Lỗi kết nối: '+e.message;
+    toast(msg,5000);document.getElementById('pmBody').innerHTML=`<div class="empty-mid"><div class="em-ico">⚠️</div><p>${esc(msg)}</p></div>`;document.getElementById('runBtn').disabled=false;
+  }
   document.getElementById('runBtn').disabled=false;
 }
 
 
 // ── RESULT RENDERING ──────────────────────────────────────
 function renderResult(raw) {
+  raw = String(raw || '');
   curResult = raw;
   document.getElementById('rawBtn').style.display = 'none';
 
@@ -1213,6 +1231,7 @@ function renderResult(raw) {
     : '<span class="b g">✅ Có thể ký</span>';
 
   function parseMdRows(text) {
+    text = String(text || '');
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.startsWith('|'));
     if (lines.length < 3) return [];
     return lines.slice(2).map(l => l.split('|').map(c => c.trim()).filter(Boolean));
@@ -1339,10 +1358,10 @@ function renderResult(raw) {
           <div style="font-size:16px;color:#adb5cc">→</div>
           <div id="curRiskPill" style="display:flex;align-items:center;gap:8px;background:#FFF8F8;border:1px solid #F09595;border-radius:8px;padding:6px 14px">
             <span style="font-size:11px;color:#6b778d">Mức rủi ro hiện tại:</span>
-            <span id="curRiskBadge" style="font-size:11px;font-weight:700;padding:3px 11px;border-radius:20px;background:#FCEBEB;color:#A32D2D;border:1px solid #F09595">${overallBadge.replace ? overallBadge : overallBadge}</span>
+            <span id="curRiskBadge" style="font-size:11px;font-weight:700;padding:3px 11px;border-radius:20px;background:#FCEBEB;color:#A32D2D;border:1px solid #F09595">${overallBadge}</span>
           </div>
         </div>
-        <div class="info-hint">Chọn <strong>✓ OK với AI</strong> hoặc <strong>✏ Ý kiến</strong> cho từng dòng<strong>✓ OK với AI</strong>, <strong>✏ Ý kiến / Sửa</strong> hoặc <strong>✔ Đã xử lý xong</strong> cho từng dòng</div>
+        
         <div class="tbl-hdr">
           <div class="th">#</div><div class="th">Nhóm / Mức độ</div><div class="th">Điều khoản</div>
           <div class="th">Nội dung cần lưu ý</div><div class="th">Phương án xử lý</div>
@@ -1426,7 +1445,7 @@ function renderOwnerConv(n) {
   
   hist.forEach((entry, i) => {
     const div = document.createElement('div');
-    if(entry.role === 'owner') {
+    if(entry.role === 'owner' || entry.role === 'owner_reply') {
       // Owner message bubble
       div.style.cssText = 'background:#EEF5FD;border:1px solid #B5D4F4;border-radius:8px;padding:6px 8px;font-size:11px;color:#0C447C;position:relative';
       div.innerHTML = '<div style="font-size:9px;font-weight:700;color:#185FA5;margin-bottom:2px">Ý KIẾN OWNER</div>' + esc(entry.text);
@@ -1621,39 +1640,39 @@ async function ownerAI(n) {
     document.getElementById('osn'+n).style.display='block';
     document.getElementById('ona'+n).classList.remove('show');
 
-    // Show AI feedback below saved note
+    // Show AI feedback — clear result with explanation
     let aiBox=document.getElementById('oai'+n);
-    if(!aiBox){aiBox=document.createElement('div');aiBox.id='oai'+n;aiBox.style.cssText='margin-top:4px;padding:6px 8px;border-radius:8px;font-size:10px;line-height:1.5;';document.getElementById('oc'+n).appendChild(aiBox);}
-    let rBg='#FDECEA',rBd='#F09595',rTx='#7f1d1d';
-    if(result.risk==='ĐÃ XỬ LÝ'||result.risk==='THẤP'){rBg='#E1F5EE';rBd='#9FE1CB';rTx='#085041';}
-    else if(result.risk==='TRUNG BÌNH'){rBg='#FAEEDA';rBd='#FAC775';rTx='#854F0B';}
-    const riskIcon=result.risk==='ĐÃ XỬ LÝ'?'✅':result.risk==='THẤP'?'🟢':result.risk==='TRUNG BÌNH'?'🟡':'🔴';
-    let bg='#fdecea',color='#7f1d1d';
-    if(result.risk==='ĐÃ XỬ LÝ'||result.risk==='THẤP'){bg='#E1F5EE';color='#085041';}
-    else if(result.risk==='TRUNG BÌNH'){bg='#FAEEDA';color='#854F0B';}
-    aiBox.style.cssText='display:block;margin-top:4px;padding:6px 8px;border-radius:8px;font-size:10px;line-height:1.5;background:'+rBg+';border:1px solid '+rBd+';color:'+rTx;
-    // Build conversation history for this row
-    if(!ownerConvHistory[n]) ownerConvHistory[n]=[];
-    ownerConvHistory[n].push({role:'owner', text:txt, risk:result.risk, note:result.note});
-    
-    // Render conversation thread (renderOwnerConv handles AI box display)
-    renderOwnerConv(n);
+    if(!aiBox){
+      aiBox=document.createElement('div');
+      aiBox.id='oai'+n;
+      document.getElementById('oc'+n).appendChild(aiBox);
+    }
+    const isResolved = result.risk==='ĐÃ XỬ LÝ'||result.risk==='DA XU LY';
+    const isLow      = result.risk==='THẤP'||result.risk==='THAP';
+    const isMed      = result.risk==='TRUNG BÌNH'||result.risk==='TRUNG BINH';
+    let rBg,rBd,rTx,rIcon,rLabel;
+    if(isResolved||isLow){ rBg='#E1F5EE';rBd='#9FE1CB';rTx='#085041';rIcon='✅';rLabel=isResolved?'Đã xử lý — Vấn đề được giải quyết':'Rủi ro Thấp'; }
+    else if(isMed){ rBg='#FAEEDA';rBd='#FAC775';rTx='#854F0B';rIcon='🟡';rLabel='Trung bình — Cần theo dõi thêm'; }
+    else { rBg='#FCEBEB';rBd='#F09595';rTx='#A32D2D';rIcon='🔴';rLabel='Nghiêm trọng — Chưa xử lý được vấn đề'; }
 
-    // Update risk badge IN the row
-    const rowEl=document.getElementById('rrc'+n);
-    if(rowEl){
-      const tagCol=rowEl.querySelector('.rc.tags');
-      if(tagCol){
-        // Add re-evaluated badge below original
-        let reBadge=tagCol.querySelector('.re-badge');
-        if(!reBadge){reBadge=document.createElement('span');reBadge.className='re-badge';tagCol.appendChild(reBadge);}
-        const rColor=result.risk==='ĐÃ XỬ LÝ'||result.risk==='THẤP'?'#EAF3DE;color:#3B6D11;border:1px solid #C0DD97':result.risk==='TRUNG BÌNH'?'#FAEEDA;color:#854F0B;border:1px solid #FAC775':'#FCEBEB;color:#A32D2D;border:1px solid #F09595';
-        reBadge.style.cssText=`display:inline-flex;align-items:center;font-size:9px;font-weight:700;padding:2px 6px;border-radius:20px;margin-top:3px;background:${rColor}`;
-        reBadge.textContent='Đánh giá lại: '+riskIcon+' '+(result.risk==='ĐÃ XỬ LÝ'?'Đã xử lý':result.risk);
-      }
-      // Update phân quyền badge
-      const authCells=rowEl.querySelectorAll('.rc:not(.tags):not(.rc.num):not(.rc.bold):not(.rc.strat):not(.owner-cell)');
-      const authCell=rowEl.querySelector('.rc[style*="border-bottom"]:nth-last-child(2)');
+    aiBox.style.cssText='display:block;margin-top:6px;padding:8px 10px;border-radius:8px;font-size:11px;line-height:1.6;background:'+rBg+';border:1px solid '+rBd+';color:'+rTx;
+    aiBox.innerHTML=
+      '<div style="font-size:10px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:5px">'+
+        rIcon+' <span>'+rLabel+'</span>'+
+      '</div>'+
+      '<div style="opacity:.9">'+esc(result.note||'Không có nhận xét thêm')+'</div>'+
+      (isResolved||isLow
+        ? '<div style="margin-top:4px;font-size:10px;font-weight:600">→ Dòng này sẽ được loại khỏi tính toán rủi ro tổng</div>'
+        : '<div style="margin-top:4px;font-size:10px;font-weight:600">→ Rủi ro được giữ nguyên/cập nhật theo đánh giá</div>'
+      );
+
+    // If resolved/low → fade row and exclude from risk calc
+    if(isResolved||isLow){
+      const rowEl=document.getElementById('rrc'+n);
+      if(rowEl) rowEl.classList.add('owner-row-done');
+    } else {
+      const rowEl=document.getElementById('rrc'+n);
+      if(rowEl) rowEl.classList.remove('owner-row-done');
     }
 
     // Store new risk for this row
@@ -1662,6 +1681,23 @@ async function ownerAI(n) {
     const ont=document.getElementById('ont'+n);
     ont.innerHTML='<span class="opt-dot"></span>Ý kiến đã lưu · AI đánh giá ✓';
     ont.style.background='#E1F5EE';ont.style.borderColor='#9FE1CB';ont.style.color='#085041';
+
+    // Update re-badge in tags column
+    const rowEl2=document.getElementById('rrc'+n);
+    if(rowEl2){
+      const tagsCol=rowEl2.querySelector('.rc.tags');
+      if(tagsCol){
+        let reBadge=tagsCol.querySelector('.re-badge');
+        if(!reBadge){reBadge=document.createElement('span');reBadge.className='re-badge';tagsCol.appendChild(reBadge);}
+        let rbBg='#FCEBEB',rbTx='#A32D2D',rbBd='#F09595',rbIcon='🔴',rbTxt='Nghiêm trọng';
+        if(isResolved){rbBg='#EAF3DE';rbTx='#3B6D11';rbBd='#C0DD97';rbIcon='✅';rbTxt='Đã xử lý';}
+        else if(isLow){rbBg='#EAF3DE';rbTx='#3B6D11';rbBd='#C0DD97';rbIcon='🟢';rbTxt='Thấp';}
+        else if(isMed){rbBg='#FAEEDA';rbTx='#854F0B';rbBd='#FAC775';rbIcon='🟡';rbTxt='Trung bình';}
+        reBadge.style.cssText='display:inline-flex;align-items:center;font-size:9px;font-weight:700;padding:2px 6px;border-radius:20px;margin-top:3px;background:'+rbBg+';color:'+rbTx+';border:1px solid '+rbBd;
+        reBadge.textContent='Đánh giá lại: '+rbIcon+' '+rbTxt;
+      }
+    }
+
     ownerUpdateFooter();
     updateOverallRisk();
   } catch(e) {

@@ -6,7 +6,7 @@ GreenNode Claw-a-thon 2026
 
 import os, sys, json, tempfile, time
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from openai import OpenAI
 
 PORT = 8080
@@ -20,19 +20,72 @@ GN_MODEL_JSON = "qwen/qwen3-5-27b"        # For structured JSON responses
 SYSTEM_PROMPT_FILE = SCRIPT_DIR / "system_prompt.txt"
 DATA_FILE = SCRIPT_DIR / "projects.json"
 
+# ── Persistent storage for AgentBase deployment ──────────────
+# Set REDIS_URL env var to a Redis/Upstash URL for persistent storage
+# e.g. REDIS_URL=redis://default:password@host:port
+# If not set, falls back to local file (data lost on container restart)
+REDIS_URL = os.environ.get("REDIS_URL", "")
+REDIS_KEY = "zalopay_legal_projects"
+
+def _redis_get():
+    try:
+        import urllib.request, base64
+        # Support upstash REST API: UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
+        rest_url = os.environ.get("UPSTASH_REDIS_REST_URL","")
+        rest_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN","")
+        if rest_url and rest_token:
+            req = urllib.request.Request(
+                f"{rest_url}/get/{REDIS_KEY}",
+                headers={"Authorization": f"Bearer {rest_token}"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+                val = data.get("result")
+                return json.loads(val) if val else {}
+    except Exception as e:
+        print(f"[redis_get error] {e}")
+    return None
+
+def _redis_set(data):
+    try:
+        import urllib.request
+        rest_url = os.environ.get("UPSTASH_REDIS_REST_URL","")
+        rest_token = os.environ.get("UPSTASH_REDIS_REST_TOKEN","")
+        if rest_url and rest_token:
+            payload = json.dumps({"value": json.dumps(data, ensure_ascii=False)}).encode()
+            req = urllib.request.Request(
+                f"{rest_url}/set/{REDIS_KEY}",
+                data=payload,
+                headers={"Authorization": f"Bearer {rest_token}", "Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return True
+    except Exception as e:
+        print(f"[redis_set error] {e}")
+    return False
+
 def load_system_prompt():
     if SYSTEM_PROMPT_FILE.exists():
         return SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
     return "Bạn là chuyên gia rà soát hợp đồng giao khoán."
 
 def load_projects():
+    # Try Redis first (AgentBase deployment)
+    redis_data = _redis_get()
+    if redis_data is not None:
+        return redis_data
+    # Fall back to local file (local dev)
     if DATA_FILE.exists():
         try: return json.loads(DATA_FILE.read_text(encoding="utf-8"))
         except: pass
     return {}
 
 def save_projects(data):
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Try Redis first
+    if not _redis_set(data):
+        # Fall back to local file
+        DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def extract_docx(file_bytes):
     from docx import Document
@@ -99,7 +152,8 @@ def review_contract(contract_text, filename, ref_mode="none", latest_text=None, 
     content = f"File cần rà soát: {filename}\nChế độ: {ctx}\n\n=== NỘI DUNG HỢP ĐỒNG CẦN RÀ SOÁT ===\n{contract_text}\n=== HẾT ==={ref_section}"
     resp = client.chat.completions.create(
         model=GN_MODEL,
-        max_tokens=4000,
+        max_tokens=3000,
+        extra_body={"enable_thinking": False, "chat_template_kwargs": {"enable_thinking": False}},
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": content + "\n\nTrả kết quả theo đúng định dạng KẾT QUẢ 1 + KẾT QUẢ 2. Không có nội dung nào khác."}
@@ -215,6 +269,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not text or len(text.strip()) < 30:
                     self.send_json({"error": "Không đọc được nội dung file"}); return
 
+                # Cloud timeout guard: keep enough context, avoid >60s gateway timeout
+                MAX_CONTRACT_CHARS = 25000
+                MAX_REF_CHARS = 10000
+                if len(text) > MAX_CONTRACT_CHARS:
+                    text = text[:MAX_CONTRACT_CHARS] + "\n\n[Đã rút gọn phần cuối để tránh timeout cloud]"
+                if latest_text and len(latest_text) > MAX_REF_CHARS:
+                    latest_text = latest_text[:MAX_REF_CHARS]
+
                 # Extract ref file if uploaded
                 ref_text = None
                 if ref_file_bytes and ref_mode == "upload":
@@ -224,6 +286,9 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             ref_text = extract_pdf(ref_file_bytes)
                     except: pass
+
+                if ref_text and len(ref_text) > MAX_REF_CHARS:
+                    ref_text = ref_text[:MAX_REF_CHARS]
 
                 # Determine latest_text usage
                 lt = latest_text if ref_mode == "latest" else None
@@ -301,14 +366,21 @@ class Handler(BaseHTTPRequestHandler):
                         "content": "You are a legal expert. Respond with ONLY a single JSON object on one line. No thinking, no explanation, no markdown. Just the JSON."
                     }, {
                         "role": "user",
-                        "content": f"""Contract clause: {dieu}
-Issue: {noi_dung}
-AI proposal: {phuong_an}
-Original risk: {risk_text}
-Owner opinion: {y_kien}
+                        "content": f"""Bạn là chuyên gia pháp lý rà soát hợp đồng giao khoán Việt Nam theo BLDS 2015 và BLLĐ 2019.
 
-Does the owner's opinion resolve the issue? Reply ONLY this JSON (no other text):
-{{"risk":"ĐÃ XỬ LÝ or THẤP or TRUNG BÌNH or NGHIÊM TRỌNG","note":"one sentence in Vietnamese"}}"""
+Vấn đề pháp lý cần xem xét:
+- Điều khoản: {dieu}
+- Mô tả vấn đề: {noi_dung}
+- Đề xuất AI ban đầu: {phuong_an}
+- Mức rủi ro ban đầu: {risk_text}
+- Ý kiến của Owner: {y_kien}
+
+Hãy đánh giá: Ý kiến của Owner có thực sự giải quyết được vấn đề pháp lý không?
+
+Trả về JSON duy nhất (không có text nào khác):
+{{"risk":"ĐÃ XỬ LÝ hoặc THẤP hoặc TRUNG BÌNH hoặc NGHIÊM TRỌNG","note":"(a) Phân loại: Đây là lý do [vận hành/pháp lý]. (b) Vì sao chưa/đã giải quyết vấn đề pháp lý. (c) Nếu chưa: hành động pháp lý cụ thể cần làm."}}
+
+QUY TẮC BẮT BUỘC: Chỉ được hạ mức rủi ro khi ý kiến Owner đề xuất GIẢI PHÁP PHÁP LÝ cụ thể (rút ngắn thời hạn, tách HĐ, điều chỉnh điều khoản). TUYỆT ĐỐI KHÔNG hạ rủi ro vì lý do vận hành (tiện lợi, mất thời gian, quy trình nội bộ). Nếu lý do vận hành → risk = {risk_text} giữ nguyên."""
                     }]
                 )
                 import json as _json
@@ -333,11 +405,29 @@ Does the owner's opinion resolve the issue? Reply ONLY this JSON (no other text)
                 print(f"[owner-ai] raw_len={len(raw)}, source={'content' if msg_dict.get('content') else 'reasoning'}")
                 
                 raw = raw.replace("```json","").replace("```","").strip()
+                # Qwen thinking mode: JSON is at the END of reasoning field
+                # Find last valid JSON object
                 if "{" in raw and "}" in raw:
-                    raw = raw[raw.index("{"):raw.rindex("}")+1]
-                print(f"[owner-ai] parsed_raw={repr(raw[:200])}")
+                    last_brace = raw.rfind("}")
+                    start = raw.rfind("{", 0, last_brace)
+                    if start >= 0:
+                        candidate = raw[start:last_brace+1]
+                        try:
+                            _json.loads(candidate)
+                            raw = candidate
+                        except Exception:
+                            raw = raw[raw.index("{"):raw.rindex("}")+1]
+                    else:
+                        raw = raw[raw.index("{"):raw.rindex("}")+1]
+                print(f"[owner-ai] parsed_raw={repr(raw[:300])}")
                 try:
                     result = _json.loads(raw)
+                    # Normalize risk text
+                    r = result.get("risk","").strip().upper()
+                    if "XU LY" in r or "XỬ LÝ" in r: result["risk"] = "ĐÃ XỬ LÝ"
+                    elif "THAP" in r or "THẤP" in r: result["risk"] = "THẤP"
+                    elif "TRUNG" in r: result["risk"] = "TRUNG BÌNH"
+                    elif "NGHIEM" in r or "NGHIÊM" in r: result["risk"] = "NGHIÊM TRỌNG"
                 except Exception:
                     result = {"risk": data.get("risk_text","TRUNG BÌNH"), "note": raw[:150] if raw else "Không nhận được phản hồi từ AI"}
                 self.send_json(result)
@@ -636,7 +726,7 @@ Does the owner's opinion resolve the issue? Reply ONLY this JSON (no other text)
 
 def main():
     print(f"\nZalopay Legal Contract — Agent\nhttp://localhost:{PORT}\n")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try: server.serve_forever()
     except KeyboardInterrupt: server.shutdown()
 
